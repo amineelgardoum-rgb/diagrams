@@ -1,0 +1,133 @@
+version: '3'
+name: logs-platform
+
+services:
+  caddy:
+      image: caddy:2
+      restart: unless-stopped
+      ports: ["80:80", "443:443"]
+      volumes:
+        - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+        - caddy_data:/data
+      depends_on: [grafana, loki]
+      networks: [monitoring]
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: adminpassword
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - monitoring
+
+  minio-init:
+    image: amazon/aws-cli:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: adminpassword
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for b in loki-data loki-archive; do
+          aws --endpoint-url http://minio:9000 s3api head-bucket --bucket $$b 2>/dev/null \
+            || aws --endpoint-url http://minio:9000 s3 mb s3://$$b
+        done
+        echo 'buckets ready'
+    networks:
+      - monitoring
+
+
+  loki:
+    image: grafana/loki:3.4.2
+    command: -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./config/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  alloy:
+    image: grafana/alloy:latest
+    command: run --server.http.listen-addr=0.0.0.0:12345 /etc/alloy/config.alloy
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "12345:12345"
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  error-gen:
+      image: alpine
+      command: sh -c 'while true; do echo "level=error msg=\"test failure\""; sleep 5; done'
+      networks: [monitoring]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER : admin 
+      GF_SECURITY_PASSWORD : admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_LOG_FILTERS: provisioning:debug ngalert:debug
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: mailpit:1025
+      GF_SMTP_FROM_ADDRESS: grafana@local.test
+      GF_SMTP_FROM_NAME: Grafana Alerts
+      GF_SMTP_SKIP_VERIFY: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: mailpit
+    ports:
+      - "8025:8025"   # web UI
+      - "1025:1025"   # SMTP
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    name: monitoring
+
+volumes:
+  loki-data:
+  grafana-data:
+  minio-data:
+  caddy_data:

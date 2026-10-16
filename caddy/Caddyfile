@@ -1,0 +1,10 @@
+localhost {
+	reverse_proxy grafana:3000
+}
+
+loki.localhost {
+	basic_auth {
+		alloy-agent $2a$14$IEGR9WP6nyZw.HCkxFpGCOI0hd/4OG1HyHNSpnlk7Zvov2OHZbdji
+	}
+	reverse_proxy loki:3100
+}

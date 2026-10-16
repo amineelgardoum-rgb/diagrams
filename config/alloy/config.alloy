@@ -1,0 +1,110 @@
+// ---------------------------------------------------------------------------
+// Grafana Alloy — collection + parsing pipeline
+//
+//   discovery.docker -> discovery.relabel -> loki.source.docker
+//        -> loki.process (docker unpack -> drop old -> multiline -> level detection)
+//        -> loki.write (Grafana Loki)
+// ---------------------------------------------------------------------------
+
+// 1. Find running containers
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// 2. Turn Docker metadata into clean labels, drop noisy targets
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+}
+
+// 3. Read their logs (raw json-file records)
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  labels     = { job = "docker" }
+  forward_to = [loki.process.normalize.receiver]
+}
+
+// 4. Parse, stitch multi-line entries, detect + normalise the level
+loki.process "normalize" {
+  // Unwrap the docker json-file envelope: {log, stream, time}
+  stage.docker {}
+
+  // Drop entries older than Loki's 7-day limit (168h) so Loki never answers
+  // "400 timestamp too old" when Alloy replays old container history.
+  stage.drop {
+    older_than          = "160h"
+    drop_counter_reason = "too_old"
+  }
+
+  // Merge indented continuations (stack traces) onto the first line
+  stage.multiline {
+    firstline     = "^[^\\s]"
+    max_wait_time = "3s"
+    max_lines     = 500
+  }
+
+  // Structured apps (JSON): pull the level out of the payload
+  stage.json {
+    expressions = {
+      level    = "level",
+      severity = "severity",
+      lvl      = "lvl",
+    }
+  }
+
+  // logfmt apps: level=info msg="..."
+  stage.logfmt {
+    mapping = {
+      level    = "",
+      severity = "",
+      lvl      = "",
+    }
+  }
+
+  // Plain text fallbacks: level=ERROR, [ERROR], " ERROR ", ...
+  stage.regex {
+    expression = "(?i)(?:level|severity|lvl)[\"'=:\\s]+(?P<level>[A-Za-z]+)"
+  }
+
+  stage.regex {
+    expression = "(?i)^[\\[\\(]?\\s*(?P<level>TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|CRITICAL|FATAL|PANIC)\\b"
+  }
+
+  // Normalise to a small stable set: TRACE DEBUG INFO WARN ERROR OTHER
+  stage.template {
+    source = "level"
+    template = "{{ if .Value }}{{ $u := upper (printf \"%v\" .Value) }}{{ if or (eq $u \"WARN\") (eq $u \"WARNING\") (eq $u \"WRN\") }}WARN{{ else if or (eq $u \"ERROR\") (eq $u \"ERR\") (eq $u \"FATAL\") (eq $u \"CRITICAL\") (eq $u \"PANIC\") }}ERROR{{ else if or (eq $u \"INFO\") (eq $u \"NOTICE\") (eq $u \"INF\") }}INFO{{ else if eq $u \"DEBUG\" }}DEBUG{{ else if eq $u \"TRACE\" }}TRACE{{ else }}OTHER{{ end }}{{ else }}OTHER{{ end }}"
+  }
+
+  // Promote the level to a Loki label (queries + alerts filter on it)
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// 5. Write to Grafana Loki (query with LogQL in Grafana)
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
